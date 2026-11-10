@@ -1,4 +1,4 @@
-name: Build Unsigned iOS IPA (Direct Cargo Approach)
+name: Build Unsigned iOS IPA (Patched Trash)
 
 on:
   workflow_dispatch:
@@ -41,48 +41,79 @@ jobs:
         run: cargo install tauri-cli --version "^2" --locked
 
       # ============================================================
-      # ধাপ ১: trash শিম ক্রেট তৈরি (iOS-এ নো-অপ)
+      # ধাপ ১: trash ক্রেটের iOS-সামঞ্জস্যপূর্ণ প্যাচড কপি তৈরি
       # ============================================================
-      - name: Create trash shim crate
+      - name: Download and patch trash crate for iOS
         run: |
           set -e
-          SHIM_DIR="$RUNNER_TEMP/trash-shim"
-          mkdir -p "$SHIM_DIR/src"
+          WORKDIR="$RUNNER_TEMP/trash-patched"
+          mkdir -p "$WORKDIR"
 
-          cat > "$SHIM_DIR/Cargo.toml" <<'EOF'
-          [package]
-          name = "trash"
-          version = "5.2.7"
-          edition = "2021"
+          # crates.io থেকে trash 5.2.7 ডাউনলোড ও এক্সট্রাক্ট
+          curl -L -o trash.crate "https://crates.io/api/v1/crates/trash/5.2.7/download"
+          tar -xzf trash.crate -C "$WORKDIR" --strip-components=1
+          rm trash.crate
 
-          [lib]
-          name = "trash"
-          path = "src/lib.rs"
+          # Python স্ক্রিপ্ট দিয়ে lib.rs প্যাচ ও iOS স্টাব তৈরি
+          python3 - <<'PY'
+          import os
 
-          [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-          trash_orig = { package = "trash", version = "5.2.7" }
-          EOF
+          workdir = os.environ['WORKDIR']
+          lib_path = os.path.join(workdir, 'src', 'lib.rs')
+          platform_stub_path = os.path.join(workdir, 'src', 'platform_ios.rs')
 
-          cat > "$SHIM_DIR/src/lib.rs" <<'EOF'
-          #[cfg(any(target_os = "ios", target_os = "android"))]
-          pub fn delete<T: AsRef<std::path::Path>>(path: T) -> Result<(), Box<dyn std::error::Error>> {
-              std::fs::remove_file(path.as_ref())?;
-              Ok(())
+          with open(lib_path, 'r') as f:
+              content = f.read()
+
+          # ১. আসল platform মডিউল শুধু নন-iOS টার্গেটে কম্পাইল হবে
+          content = content.replace(
+              'mod platform;',
+              '#[cfg(not(any(target_os = "ios", target_os = "android")))]\nmod platform;'
+          )
+
+          # ২. iOS/Android-এর জন্য স্টাব platform মডিউল কম্পাইল হবে
+          content = content.replace(
+              '#[cfg(not(any(target_os = "ios", target_os = "android")))]\nmod platform;',
+              '#[cfg(not(any(target_os = "ios", target_os = "android")))]\nmod platform;\n\n#[cfg(any(target_os = "ios", target_os = "android"))]\n#[path = "platform_ios.rs"]\nmod platform;'
+          )
+
+          with open(lib_path, 'w') as f:
+              f.write(content)
+
+          # ৩. iOS স্টাব তৈরি: PlatformTrashContext ও প্রয়োজনীয় ফাংশন
+          stub = r'''
+          // iOS/Android-এর জন্য স্টাব ইমপ্লিমেন্টেশন
+          // আসল ডেস্কটপ ট্র্যাশ সিস্টেম না থাকায় সরাসরি ফাইল ডিলিট করা হবে।
+
+          use std::path::{Path, PathBuf};
+
+          pub struct PlatformTrashContext {
+              // কোনো স্টেট প্রয়োজন নেই
           }
-          #[cfg(any(target_os = "ios", target_os = "android"))]
-          pub fn delete_all<T: AsRef<std::path::Path>>(paths: &[T]) -> Result<(), Box<dyn std::error::Error>> {
-              for p in paths { std::fs::remove_file(p.as_ref())?; }
-              Ok(())
-          }
-          #[cfg(not(any(target_os = "ios", target_os = "android")))]
-          pub use trash_orig::*;
-          EOF
 
-          echo "Shim crate created at: $SHIM_DIR"
-          echo "SHIM_DIR=$SHIM_DIR" >> $GITHUB_ENV
+          impl PlatformTrashContext {
+              pub fn new() -> Self {
+                  Self {}
+              }
+
+              pub fn delete_all_canonicalized(&self, paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
+                  for p in paths {
+                      std::fs::remove_file(p)?;
+                  }
+                  Ok(())
+              }
+          }
+
+          // যদি crate-এর অন্য ফাংশনও platform মডিউলের উপর নির্ভর করে, সেগুলো এখানে যোগ করুন।
+          '''
+          with open(platform_stub_path, 'w') as f:
+              f.write(stub)
+
+          print("Patched trash crate created at:", workdir)
+          PY
 
       # ============================================================
-      # ধাপ ২: iOS প্রজেক্ট ইনিশিয়ালাইজ (শুধু একবার)
+      # ধাপ ২: iOS প্রজেক্ট ইনিশিয়ালাইজ
       # ============================================================
       - name: Initialize iOS project (if not already generated)
         run: |
@@ -91,28 +122,25 @@ jobs:
           fi
 
       # ============================================================
-      # ধাপ ৩: cargo build + --config patch (মূল ধাপ)
+      # ধাপ ৩: cargo build + প্যাচড trash ক্রেট
       # ============================================================
-      - name: Build Rust library for iOS with cargo --config patch
+      - name: Build Rust library for iOS with patched trash
         run: |
           set -e
           cd src-tauri
+          rm -f Cargo.lock   # পুরোনো লকফাইল সরান
 
-          # Cargo.lock সরান যাতে প্যাচ কার্যকর হয়
-          rm -f Cargo.lock
-
-          # --config দিয়ে trash প্যাচ ইনজেক্ট করা হচ্ছে
           cargo build \
             --package omniget \
             --target aarch64-apple-ios \
             --release \
             --lib \
-            --config "patch.crates-io.trash.path='${{ env.SHIM_DIR }}'"
+            --config "patch.crates-io.trash.path='${{ env.WORKDIR }}'"
 
-          echo "Rust library built successfully."
+          echo "Rust library built successfully for iOS."
 
       # ============================================================
-      # ধাপ ৪: Xcode প্রজেক্ট প্যাচ + xcodebuild
+      # ধাপ ৪: Xcode কোড সাইনিং ডিজেবল + xcodebuild
       # ============================================================
       - name: Disable code signing and build with xcodebuild
         run: |
@@ -123,12 +151,11 @@ jobs:
             exit 1
           fi
 
-          # কোড সাইনিং ডিজেবল
+          # কোড সাইনিং সম্পূর্ণ বন্ধ
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES;/CODE_SIGNING_ALLOWED = NO;/g' "$PBXPROJ" || true
           sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBXPROJ" || true
           sed -i '' 's/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = "";/g' "$PBXPROJ" || true
 
-          # xcodebuild দিয়ে .app তৈরি
           XCODEPROJ=$(find src-tauri/gen/apple -name "*.xcodeproj" -maxdepth 2 | head -n 1)
           cd src-tauri/gen/apple
 
