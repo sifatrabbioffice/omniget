@@ -1,4 +1,4 @@
-name: Build Unsigned iOS IPA (All-in-One)
+name: Build Unsigned iOS IPA (Direct Cargo Approach)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,6 @@ jobs:
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        # version লিখবেন না — package.json-এর packageManager থেকে অটো ডিটেক্ট হবে
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -38,20 +37,19 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Install Tauri CLI
+      - name: Install Tauri CLI (only for ios init)
         run: cargo install tauri-cli --version "^2" --locked
 
       # ============================================================
-      # ধাপ ১: trash ক্রেটের iOS প্যাচ তৈরি
+      # ধাপ ১: trash শিম ক্রেট তৈরি (iOS-এ নো-অপ)
       # ============================================================
-      - name: Create patched trash crate (iOS/Android no-op)
+      - name: Create trash shim crate
         run: |
           set -e
-          PATCH_DIR="src-tauri/patched-trash"
-          mkdir -p "$PATCH_DIR/src"
+          SHIM_DIR="$RUNNER_TEMP/trash-shim"
+          mkdir -p "$SHIM_DIR/src"
 
-          # patched crate-এর Cargo.toml
-          cat > "$PATCH_DIR/Cargo.toml" <<'EOF'
+          cat > "$SHIM_DIR/Cargo.toml" <<'EOF'
           [package]
           name = "trash"
           version = "5.2.7"
@@ -65,59 +63,26 @@ jobs:
           trash_orig = { package = "trash", version = "5.2.7" }
           EOF
 
-          # patched crate-এর lib.rs
-          cat > "$PATCH_DIR/src/lib.rs" <<'EOF'
-          // iOS/Android-এ Trash সিস্টেম নেই — সরাসরি ফাইল ডিলিট করা হবে
+          cat > "$SHIM_DIR/src/lib.rs" <<'EOF'
           #[cfg(any(target_os = "ios", target_os = "android"))]
           pub fn delete<T: AsRef<std::path::Path>>(path: T) -> Result<(), Box<dyn std::error::Error>> {
               std::fs::remove_file(path.as_ref())?;
               Ok(())
           }
-
           #[cfg(any(target_os = "ios", target_os = "android"))]
           pub fn delete_all<T: AsRef<std::path::Path>>(paths: &[T]) -> Result<(), Box<dyn std::error::Error>> {
-              for p in paths {
-                  std::fs::remove_file(p.as_ref())?;
-              }
+              for p in paths { std::fs::remove_file(p.as_ref())?; }
               Ok(())
           }
-
-          // ডেস্কটপে আসল trash ক্রেট ব্যবহার হবে
           #[cfg(not(any(target_os = "ios", target_os = "android")))]
           pub use trash_orig::*;
           EOF
 
-          echo "Patched trash crate created at $PATCH_DIR"
+          echo "Shim crate created at: $SHIM_DIR"
+          echo "SHIM_DIR=$SHIM_DIR" >> $GITHUB_ENV
 
       # ============================================================
-      # ধাপ ২: Cargo.toml-এ patch + Cargo.lock রিমুভ
-      # ============================================================
-      - name: Patch src-tauri/Cargo.toml
-        run: |
-          set -e
-          CARGO_TOML="src-tauri/Cargo.toml"
-
-          # যদি [patch.crates-io] আগে থেকে থাকে, সেটি সরিয়ে ফেলুন (idempotent)
-          if grep -q "^\[patch.crates-io\]" "$CARGO_TOML"; then
-            sed -i '' '/^\[patch.crates-io\]/,/^$/d' "$CARGO_TOML"
-          fi
-
-          # [patch.crates-io] সেকশন যোগ করুন
-          cat >> "$CARGO_TOML" <<'EOF'
-
-          [patch.crates-io]
-          trash = { path = "patched-trash" }
-          EOF
-
-          echo "=== Cargo.toml tail after patch ==="
-          tail -n 10 "$CARGO_TOML"
-
-          # পুরোনো Cargo.lock সরান — যাতে নতুন প্যাচ কাজ করে
-          rm -f src-tauri/Cargo.lock
-          echo "Cargo.lock removed."
-
-      # ============================================================
-      # ধাপ ৩: iOS প্রজেক্ট ইনিশিয়ালাইজ
+      # ধাপ ২: iOS প্রজেক্ট ইনিশিয়ালাইজ (শুধু একবার)
       # ============================================================
       - name: Initialize iOS project (if not already generated)
         run: |
@@ -126,82 +91,88 @@ jobs:
           fi
 
       # ============================================================
-      # ধাপ ৪: Xcode কোড সাইনিং ডিজেবল
+      # ধাপ ৩: cargo build + --config patch (মূল ধাপ)
       # ============================================================
-      - name: Disable code signing in Xcode project
+      - name: Build Rust library for iOS with cargo --config patch
         run: |
+          set -e
+          cd src-tauri
+
+          # Cargo.lock সরান যাতে প্যাচ কার্যকর হয়
+          rm -f Cargo.lock
+
+          # --config দিয়ে trash প্যাচ ইনজেক্ট করা হচ্ছে
+          cargo build \
+            --package omniget \
+            --target aarch64-apple-ios \
+            --release \
+            --lib \
+            --config "patch.crates-io.trash.path='${{ env.SHIM_DIR }}'"
+
+          echo "Rust library built successfully."
+
+      # ============================================================
+      # ধাপ ৪: Xcode প্রজেক্ট প্যাচ + xcodebuild
+      # ============================================================
+      - name: Disable code signing and build with xcodebuild
+        run: |
+          set -e
           PBXPROJ=$(find src-tauri/gen/apple -name "project.pbxproj" | head -n 1)
           if [ -z "$PBXPROJ" ]; then
             echo "::error::project.pbxproj not found!"
             exit 1
           fi
-          echo "Patching: $PBXPROJ"
 
-          # সব build configuration-এ কোড সাইনিং বন্ধ
+          # কোড সাইনিং ডিজেবল
           sed -i '' 's/CODE_SIGNING_ALLOWED = YES;/CODE_SIGNING_ALLOWED = NO;/g' "$PBXPROJ" || true
           sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' "$PBXPROJ" || true
-          sed -i '' 's/CODE_SIGN_IDENTITY = "Apple Development";/CODE_SIGN_IDENTITY = "";/g' "$PBXPROJ" || true
           sed -i '' 's/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = "";/g' "$PBXPROJ" || true
 
-          # যদি CODE_SIGNING_ALLOWED = NO সেট না থাকে, buildSettings-এ inject করুন
-          if ! grep -q "CODE_SIGNING_ALLOWED = NO" "$PBXPROJ"; then
-            sed -i '' 's/buildSettings = {/buildSettings = {\n\t\t\t\tCODE_SIGNING_ALLOWED = NO;/g' "$PBXPROJ" || true
-          fi
+          # xcodebuild দিয়ে .app তৈরি
+          XCODEPROJ=$(find src-tauri/gen/apple -name "*.xcodeproj" -maxdepth 2 | head -n 1)
+          cd src-tauri/gen/apple
 
-          echo "Code signing disabled in $PBXPROJ"
+          xcodebuild -project "$XCODEPROJ" \
+            -scheme omniget_iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
       # ============================================================
-      # ধাপ ৫: iOS বিল্ড (সাইনিং ছাড়া)
-      # ============================================================
-      - name: Build iOS app
-        id: ios_build
-        continue-on-error: true
-        run: pnpm tauri ios build
-
-      # ============================================================
-      # ধাপ ৬: .app ফাইল খোঁজা
+      # ধাপ ৫: .app খোঁজা
       # ============================================================
       - name: Locate .app artifact
         id: find_app
         run: |
-          echo "--- Searching for .app bundles ---"
-          find src-tauri/gen/apple -name "*.app" -type d 2>/dev/null || true
-          echo "-----------------------------------"
-
-          APP_PATH=$(find src-tauri/gen/apple -name "*.app" -type d | head -n 1)
-          echo "Found .app at: '$APP_PATH'"
+          APP_PATH=$(find src-tauri/gen/apple/build -name "*.app" -type d | head -n 1)
           echo "APP_PATH=$APP_PATH" >> $GITHUB_OUTPUT
-
           if [ -z "$APP_PATH" ]; then
-            echo "::error::No .app file found. The build genuinely failed. Check build logs above."
+            echo "::error::No .app found after xcodebuild."
             exit 1
           fi
 
       # ============================================================
-      # ধাপ ৭: ম্যানুয়ালি আনসাইনড IPA প্যাকেজিং
+      # ধাপ ৬: আনসাইনড IPA প্যাকেজিং
       # ============================================================
-      - name: Package unsigned IPA manually
+      - name: Package unsigned IPA
         run: |
           set -e
           APP_PATH="${{ steps.find_app.outputs.APP_PATH }}"
           APP_NAME=$(basename "$APP_PATH" .app)
-
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
-
-          # সঠিক পারমিশন সেট
           chmod -R 755 Payload/
           find Payload -type f -exec chmod 644 {} \;
-
-          IPA_NAME="${APP_NAME}-unsigned.ipa"
-          zip -r -q "$IPA_NAME" Payload/
+          zip -r -q "${APP_NAME}-unsigned.ipa" Payload/
           rm -rf Payload
-
-          echo "IPA created: $IPA_NAME"
-          ls -lh "$IPA_NAME"
+          echo "IPA created: ${APP_NAME}-unsigned.ipa"
 
       # ============================================================
-      # ধাপ ৮: IPA আপলোড
+      # ধাপ ৭: IPA আপলোড
       # ============================================================
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
@@ -209,12 +180,3 @@ jobs:
           name: OmniGet-unsigned-ipa
           path: "*-unsigned.ipa"
           if-no-files-found: error
-
-      # ============================================================
-      # ধাপ ৯ (অপশনাল): বিল্ড ফেল হলে লগ দেখানো
-      # ============================================================
-      - name: Show build failure hint
-        if: steps.ios_build.outcome == 'failure' && steps.find_app.outputs.APP_PATH != ''
-        run: |
-          echo "::warning::Tauri CLI exited with error (likely code signing), but .app was created successfully."
-          echo "Unsigned IPA is still being produced from the .app bundle."
