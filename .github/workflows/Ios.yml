@@ -1,0 +1,76 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:   # ম্যানুয়ালি ট্রিগার করার জন্য
+  push:
+    branches: [main]   # অথবা আপনার ডিফল্ট ব্রাঞ্চ
+
+jobs:
+  build-ios-unsigned:
+    runs-on: macos-14   # Apple Silicon রানার (Xcode 15+)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.29.3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend (Svelte)
+        run: pnpm build
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Initialize iOS platform (if not already present)
+        run: |
+          if [ ! -d "src-tauri/gen/apple" ]; then
+            pnpm tauri ios init
+          fi
+
+      - name: Build iOS app (unsigned)
+        run: |
+          pnpm tauri ios build --release \
+            --config '{"tauri":{"bundle":{"iOS":{"codeSign":false}}}}'
+        env:
+          CI: true
+
+      - name: Locate .app bundle
+        id: find_app
+        run: |
+          APP_PATH=$(find src-tauri/gen/apple -name "*.app" -type d | head -n 1)
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "Found app at: $APP_PATH"
+
+      - name: Package into unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -R "${{ steps.find_app.outputs.APP_PATH }}" Payload/
+          zip -r -q OmniGet-unsigned.ipa Payload/
+          rm -rf Payload
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniGet-unsigned-ipa
+          path: OmniGet-unsigned.ipa
+          if-no-files-found: error
