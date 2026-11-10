@@ -1,13 +1,12 @@
 name: Build Unsigned iOS IPA
 
 on:
-  workflow_dispatch:   # ম্যানুয়ালি ট্রিগার করার জন্য
-  push:
-    branches: [main]   # অথবা আপনার ডিফল্ট ব্রাঞ্চ
+  workflow_dispatch:   # শুধু ম্যানুয়ালি ট্রিগার — অন্য ওয়ার্কফ্লোতে হস্তক্ষেপ করবে না
 
 jobs:
-  build-ios-unsigned:
-    runs-on: macos-14   # Apple Silicon রানার (Xcode 15+)
+  build-ios:
+    runs-on: macos-15   # Xcode 16+ সমর্থিত, iOS বিল্ডের জন্য উপযুক্ত
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -20,55 +19,79 @@ jobs:
           cache: 'pnpm'
 
       - name: Install pnpm
-        run: npm install -g pnpm@10.29.3
+        run: npm install -g pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
 
-      - name: Cache Rust dependencies
+      - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Install frontend dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend (Svelte)
-        run: pnpm build
-
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
 
-      - name: Initialize iOS platform (if not already present)
+      - name: Initialize iOS project (if not already generated)
         run: |
           if [ ! -d "src-tauri/gen/apple" ]; then
             pnpm tauri ios init
           fi
 
       - name: Build iOS app (unsigned)
-        run: |
-          pnpm tauri ios build --release \
-            --config '{"tauri":{"bundle":{"iOS":{"codeSign":false}}}}'
-        env:
-          CI: true
+        id: ios_build
+        continue-on-error: true
+        run: pnpm tauri ios build --no-sign
 
-      - name: Locate .app bundle
-        id: find_app
+      - name: Locate built artifacts
+        id: find_artifacts
         run: |
+          # Tauri CLI-এর আউটপুট লোকেশন চেক করা হচ্ছে
+          echo "--- Searching for .app and .ipa files ---"
+          find src-tauri/gen/apple -name "*.app" -type d 2>/dev/null || true
+          find src-tauri/gen/apple -name "*.ipa" -type f 2>/dev/null || true
+          echo "----------------------------------------"
+
           APP_PATH=$(find src-tauri/gen/apple -name "*.app" -type d | head -n 1)
-          echo "APP_PATH=$APP_PATH" >> $GITHUB_OUTPUT
-          echo "Found app at: $APP_PATH"
+          IPA_PATH=$(find src-tauri/gen/apple -name "*.ipa" -type f | head -n 1)
 
-      - name: Package into unsigned IPA
+          echo "APP_PATH=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "IPA_PATH=$IPA_PATH" >> $GITHUB_OUTPUT
+
+      - name: Fail if no artifact was produced
+        if: steps.find_artifacts.outputs.APP_PATH == '' && steps.find_artifacts.outputs.IPA_PATH == ''
         run: |
+          echo "::error::No .app or .ipa file was produced. Check the build logs above."
+          exit 1
+
+      - name: Package unsigned IPA (if Tauri did not produce one)
+        if: steps.find_artifacts.outputs.IPA_PATH == '' && steps.find_artifacts.outputs.APP_PATH != ''
+        run: |
+          APP_PATH="${{ steps.find_artifacts.outputs.APP_PATH }}"
+          echo "Manually packaging .app into unsigned IPA: $APP_PATH"
+
           mkdir -p Payload
-          cp -R "${{ steps.find_app.outputs.APP_PATH }}" Payload/
+          cp -R "$APP_PATH" Payload/
           zip -r -q OmniGet-unsigned.ipa Payload/
           rm -rf Payload
 
-      - name: Upload IPA artifact
+          echo "Created OmniGet-unsigned.ipa"
+
+      - name: Use Tauri-built IPA (if available)
+        if: steps.find_artifacts.outputs.IPA_PATH != ''
+        run: |
+          cp "${{ steps.find_artifacts.outputs.IPA_PATH }}" OmniGet-unsigned.ipa
+          echo "Using Tauri-built IPA directly."
+
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
           name: OmniGet-unsigned-ipa
