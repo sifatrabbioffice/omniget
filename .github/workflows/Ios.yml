@@ -12,18 +12,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ✅ pnpm আগে ইনস্টল করতে হবে, নাহলে setup-node-এর cache: 'pnpm' কাজ করবে না
+      # package.json-এর "packageManager": "pnpm@10.29.3" থেকে অটো ডিটেক্ট হবে
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'pnpm'   # এখন pnpm PATH-এ আছে, তাই এটি ঠিকমতো কাজ করবে
+          cache: 'pnpm'
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
